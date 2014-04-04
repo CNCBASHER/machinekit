@@ -49,6 +49,9 @@
 * Copyright (c) 2004 All rights reserved.
 *
 * Last change: 
+* cncbasher added ArcEyes mods for Orac & Triac toolchangers 4-4-2014 
+
+
 ********************************************************************/
 
 #include <stdio.h>
@@ -89,8 +92,10 @@ struct iocontrol_str {
     hal_bit_t *coolant_flood;	/* coolant flood output pin */
     hal_bit_t *lube;		/* lube output pin */
     hal_bit_t *lube_level;	/* lube level input pin */
-
-
+    // NEW pins to generate auto update of tool number at startup when using
+    // ArcEye's EMCO toolchanger component
+    hal_s32_t *currenttool; /* input to set current tool at start up */
+    hal_bit_t *initialised;	/* has the current tool been initialised? Used as a flag internally */
     // the following pins are needed for toolchanging
     //tool-prepare
     hal_bit_t *tool_prepare;	/* output, pin that notifies HAL it needs to prepare a tool */
@@ -455,6 +460,35 @@ int iocontrol_hal_init(void)
 	hal_exit(comp_id);
 	return -1;
     }
+
+////////// NEW SECTION 
+
+    // initialised
+    retval = hal_pin_bit_newf(HAL_OUT, &(iocontrol_data->initialised), comp_id, 
+			     "iocontrol.%d.initialised", n);
+    if (retval < 0) 
+        {
+    	rtapi_print_msg(RTAPI_MSG_ERR,
+		"IOCONTROL: ERROR: iocontrol %d pin initialised export failed with err=%i\n",n, retval);
+    	hal_exit(comp_id);
+	    return -1;
+        }
+  
+    // currenttool
+    retval = hal_pin_s32_newf(HAL_IN, &(iocontrol_data->currenttool), comp_id, 
+			      "iocontrol.%d.currenttool", n);
+    if (retval < 0) 
+        {
+    	rtapi_print_msg(RTAPI_MSG_ERR,
+			"IOCONTROL: ERROR: iocontrol %d pin currenttool export failed with err=%i\n", n, retval);
+    	hal_exit(comp_id);
+	    return -1;
+        }
+    
+////////////////////////////    
+
+
+
     // tool-prepared
     retval = hal_pin_bit_newf(HAL_IN, &(iocontrol_data->tool_prepared), comp_id, 
 			      "iocontrol.%d.tool-prepared", n);
@@ -521,6 +555,18 @@ int iocontrol_hal_init(void)
 *
 * Called By: main
 ********************************************************************/
+
+///////////NEW
+
+void hal_init_pins_once(void)  // don't want these pins reset once initialised'
+{
+   *(iocontrol_data->currenttool) = 0;
+   *(iocontrol_data->initialised) = 0;
+}
+
+/////////////////////////
+
+
 void hal_init_pins(void)
 {
     *(iocontrol_data->user_enable_out)=0;	/* output, FALSE when EMC wants stop */
@@ -570,6 +616,13 @@ int read_hal_inputs(void)
     if (oldval != emcioStatus.lube.level) {
 	retval = 1;
     }
+    
+        // NEW CODE
+    // this triggers a status update, which is the easiest way to force an tool update
+    // without injecting messages directly into the system
+    if( (*(iocontrol_data->tool_prepare) == 1) &&  (*(iocontrol_data->tool_prepare) = 1) ) 
+        retval = 1;
+
     return retval;
 }
 
@@ -763,6 +816,13 @@ int main(int argc, char *argv[])
     emcioStatus.lube.on = 0;
     emcioStatus.lube.level = 1;
 
+    //////////////////////cncbasher
+    
+    hal_init_pins_once(); // Initialise then don't touch again in estop or whatever
+
+    //////////////////////////
+
+
     while (!done) {
 	// check for inputs from HAL (updates emcioStatus)
 	// returns 1 if any of the HAL pins changed from the last time we checked
@@ -804,6 +864,36 @@ int main(int argc, char *argv[])
 
 	type = emcioCommand->type;
 	emcioStatus.status = RCS_DONE;
+
+///  cncbasher   ////////////////////////////////////
+//
+//  Want to update Axis with the current toolnumber from the ATC
+// Axis does not remember the current tool number, so once only detect from greyscale disc and number
+// becomes available to modified io module.
+// io triggers a toolchange state, instructing to change to the tool detected
+// Because that tool is already current, this component does nothing and passes back a 'toolchanged' signal
+// When io receives this it sets the appropriate NML code and axis updates the tool loaded display	
+////////////////////////////////////////////////////
+
+	if(*(iocontrol_data->initialised) == 0)
+	    {
+    	if((*(iocontrol_data->currenttool) > 0) && (*(iocontrol_data->currenttool) < 9)) // if it contains a valid number
+    	    {
+    	    *(iocontrol_data->tool_prepare) = 1;
+    	    *(iocontrol_data->tool_prep_pocket) = *(iocontrol_data->currenttool);
+    	    *(iocontrol_data->tool_prep_number) = *(iocontrol_data->currenttool);
+    	    *(iocontrol_data->tool_number) = *(iocontrol_data->currenttool);
+    	    *(iocontrol_data->tool_change) = 1;
+    	    *(iocontrol_data->initialised) = 1; 
+    	    emcioStatus.tool.toolInSpindle = *(iocontrol_data->currenttool);
+    	    reload_tool_number(emcioStatus.tool.toolInSpindle);
+    	    }
+	    }
+///////////////////////////////////////////////	    
+	
+
+
+
 
 	switch (type) {
 	case 0:
@@ -946,13 +1036,13 @@ int main(int argc, char *argv[])
 
 	case EMC_TOOL_SET_NUMBER_TYPE:
 	    {
-		int pocket_number;
+		int number;
 		
-		pocket_number = ((EMC_TOOL_SET_NUMBER *) emcioCommand)->tool;
-		rtapi_print_msg(RTAPI_MSG_DBG, "EMC_TOOL_SET_NUMBER old_loaded_tool=%d new_pocket_number=%d new_tool=%d\n", emcioStatus.tool.toolInSpindle, pocket_number, emcioStatus.tool.toolTable[pocket_number].toolno);
-		emcioStatus.tool.toolInSpindle = emcioStatus.tool.toolTable[pocket_number].toolno;
+		number = ((EMC_TOOL_SET_NUMBER *) emcioCommand)->tool;
+		rtapi_print_msg(RTAPI_MSG_DBG, "EMC_TOOL_SET_NUMBER old_loaded=%d new_number=%d\n", emcioStatus.tool.toolInSpindle, number);
+		emcioStatus.tool.toolInSpindle = number;
 		*(iocontrol_data->tool_number) = emcioStatus.tool.toolInSpindle; //likewise in HAL
-                load_tool(pocket_number);
+    //            load_tool(pocket_number);
 	    }
 	    break;
 
